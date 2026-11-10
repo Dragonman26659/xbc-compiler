@@ -1,0 +1,6 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The source code, installer, examples and tests in this extension are licensed
+under the GNU General Public License, version 2 or (at your option) any later
+version. They are provided without warranty. See the full license text in
+QEMU's COPYING file or https://www.gnu.org/licenses/old-licenses/gpl-2.0.html.

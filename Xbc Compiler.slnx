@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Xbc Compiler/Xbc Compiler.vcxproj" Id="33d2389b-07ad-4058-9386-54691d463cdf" />
+  <Project Path="xbcSim/xbcSim.vcxproj" Id="658e794f-6d17-4957-a951-8b709cce26fd" />
+</Solution>

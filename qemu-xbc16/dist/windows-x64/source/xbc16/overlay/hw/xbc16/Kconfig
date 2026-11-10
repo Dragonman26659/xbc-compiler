@@ -1,0 +1,4 @@
+config XBC16_BOARD
+    bool
+    default y
+    depends on XBC16
