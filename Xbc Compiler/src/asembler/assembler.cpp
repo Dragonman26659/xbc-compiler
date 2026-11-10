@@ -177,6 +177,7 @@ void processLine(string& line) {
 	StripWhitespace(line);
 
 	if (!line.empty()) {
+		// if line contains a .include "file" replace the line with a token that points to a map where we load the file contents
 		rawCode.push_back(line);
 	}
 }
@@ -197,6 +198,8 @@ void ProsessFile(const string& inputFile) {
 	if (input.bad()) {
 		ERROR("Failed reading input file: " + inputFile);
 	}
+
+	// replace the .include tokens with the contents of the included files
 }
 
 void SplitSegments() {
