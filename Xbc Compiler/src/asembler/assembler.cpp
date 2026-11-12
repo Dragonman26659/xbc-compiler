@@ -7,6 +7,9 @@
 #include <stdexcept>
 #include <utility>
 #include <algorithm>
+#include <filesystem>
+#include <set>
+#include <sstream>
 #include "../../../common/float16.h"
 
 bool is16bit = false;
@@ -15,6 +18,7 @@ int instructionCount = 0;
 vector<string> rawCode;
 vector<string> dataSection;
 vector<string> codeSection;
+
 
 map<string, label> labels;
 // Internal labels may name a private immediate operand inside an instruction.
@@ -33,7 +37,8 @@ namespace {
 
 	const string addressRegister = "r14";
 	map<string, size_t> symbolAddresses;
-	map<string, uint16_t> dataWordValues;
+	map<string, vector<uint16_t>> dataWordValues;
+	size_t dataWordCount = 0;
 	size_t codeWordCount = 0;
 	size_t internalLabelCount = 0;
 	long long ParseNumber(const string& inputString);
@@ -96,7 +101,7 @@ namespace {
 
 		unsigned registerIndex = GetRegisterIndex(inputString, maximumValue);
 
-        (void)registerIndex; // All sixteen hardware registers are addressable.
+		(void)registerIndex; // All sixteen hardware registers are addressable.
 	}
 
 
@@ -124,21 +129,22 @@ namespace {
 	}
 
 
-    uint16_t ConvertFloatData(const string& inputString) {
-        if (!is16bit) ERROR("FWORD requires 16BC");
-        return Convert16Bit(inputString, FWORD);
-    }
+	uint16_t ConvertFloatData(const string& inputString) {
+		if (!is16bit) ERROR("FWORD requires 16BC");
+		return Convert16Bit(inputString, FWORD);
+	}
 
 	void ResetAssembly() {
 		is16bit = false;
 		instructionCount = 0;
 		codeWordCount = 0;
+		dataWordCount = 0;
 		internalLabelCount = 0;
 		rawCode.clear();
 		dataSection.clear();
 		codeSection.clear();
 		labels.clear();
-        internalLabelWordOffsets.clear();
+		internalLabelWordOffsets.clear();
 		codeToInst.clear();
 		dataMap.clear();
 		dataWordValues.clear();
@@ -182,24 +188,66 @@ void processLine(string& line) {
 	}
 }
 
+namespace {
+	// Includes are expanded in-place, so section state and declaration order
+	// naturally continue across file boundaries. Paths are relative to the
+	// including file, not the process working directory.
+	void ProcessFileRecursive(const filesystem::path& inputPath, set<string>& activeFiles) {
+		error_code pathError;
+		filesystem::path resolvedPath = filesystem::weakly_canonical(inputPath, pathError);
+		if (pathError) resolvedPath = filesystem::absolute(inputPath, pathError);
+		string pathKey = (pathError ? inputPath : resolvedPath).string();
+
+		if (activeFiles.count(pathKey)) {
+			ERROR("Circular .include detected: " + pathKey);
+		}
+
+		ifstream input(inputPath);
+		if (!input) {
+			ERROR("Cannot open input file: " + inputPath.string());
+		}
+
+		activeFiles.insert(pathKey);
+		string line;
+		size_t lineNumber = 0;
+		while (getline(input, line)) {
+			++lineNumber;
+			stripComments(line);
+			StripWhitespace(line);
+			if (line.empty()) continue;
+
+			string upperLine = ToUpper(line);
+			if (upperLine.rfind(".INCLUDE", 0) == 0) {
+				string argument = line.substr(8);
+				StripWhitespace(argument);
+				if (argument.size() < 2 ||
+					!((argument.front() == '"' && argument.back() == '"') ||
+						(argument.front() == '<' && argument.back() == '>'))) {
+					ERROR("Expected .include \"file\" or .include <file> at " +
+						inputPath.string() + ":" + to_string(lineNumber));
+				}
+
+				string includeName = argument.substr(1, argument.size() - 2);
+				if (includeName.empty()) {
+					ERROR("Empty .include path at " + inputPath.string() + ":" + to_string(lineNumber));
+				}
+				ProcessFileRecursive(inputPath.parent_path() / includeName, activeFiles);
+			}
+			else {
+				rawCode.push_back(line);
+			}
+		}
+
+		if (input.bad()) {
+			ERROR("Failed reading input file: " + inputPath.string());
+		}
+		activeFiles.erase(pathKey);
+	}
+}
+
 void ProsessFile(const string& inputFile) {
-	ifstream input(inputFile);
-
-	if (!input) {
-		ERROR("Cannot open input file: " + inputFile);
-	}
-
-
-	string line;
-
-	while (getline(input, line)) {
-		processLine(line);
-	}
-	if (input.bad()) {
-		ERROR("Failed reading input file: " + inputFile);
-	}
-
-	// replace the .include tokens with the contents of the included files
+	set<string> activeFiles;
+	ProcessFileRecursive(filesystem::path(inputFile), activeFiles);
 }
 
 void SplitSegments() {
@@ -233,64 +281,116 @@ void SplitSegments() {
 //				DATA SECTION
 //============================================
 
+namespace {
+	vector<string> SplitArrayValues(const string& initializer) {
+		vector<string> values;
+		string value;
+		for (char character : initializer) {
+			if (character == ',') {
+				StripWhitespace(value);
+				if (value.empty()) ERROR("Empty value in array initializer");
+				values.push_back(value);
+				value.clear();
+			}
+			else {
+				value += character;
+			}
+		}
+		StripWhitespace(value);
+		if (!value.empty()) values.push_back(value);
+		else if (!values.empty()) ERROR("Trailing comma in array initializer");
+		return values;
+	}
+}
+
 void MapData() {
-	int offset = 0;
+	size_t offset = 0;
 
 	for (const string& line : dataSection) {
-		auto tokens = splitLine(line);
-
-		if (tokens.size() != 2 && tokens.size() != 3) {
+		istringstream stream(line);
+		string typeToken, declaration;
+		stream >> typeToken >> declaration;
+		if (typeToken.empty() || declaration.empty()) {
 			ERROR("Expected TYPE name [value]: " + line);
 		}
 
-
-		string typeName = ToUpper(tokens[0]);
+		string typeName = ToUpper(typeToken);
 		DATATYPE type;
+		if (typeName == "WORD") type = WORD;
+		else if (typeName == "SWORD") type = SWORD;
+		else if (typeName == "FWORD") type = FWORD;
+		else ERROR("Unknown data type: " + typeToken);
 
-		if (typeName == "WORD") {
-			type = WORD;
-		}
-		else if (typeName == "SWORD") {
-			type = SWORD;
-		}
-		else if (typeName == "FWORD") {
-			type = FWORD;
+		if (type == FWORD && !is16bit) ERROR("FWORD requires 16BC");
+
+		string symbolName;
+		size_t arraySize = 1;
+		bool isArray = false;
+		size_t openBracket = declaration.find('[');
+		if (openBracket != string::npos) {
+			size_t closeBracket = declaration.find(']', openBracket);
+			if (closeBracket == string::npos || closeBracket != declaration.size() - 1) {
+				ERROR("Malformed array declaration: " + declaration);
+			}
+			symbolName = declaration.substr(0, openBracket);
+			string sizeText = declaration.substr(openBracket + 1, closeBracket - openBracket - 1);
+			long long parsedSize = ParseNumber(sizeText);
+			if (parsedSize <= 0) ERROR("Array size must be positive: " + declaration);
+			arraySize = static_cast<size_t>(parsedSize);
+			isArray = true;
 		}
 		else {
-			ERROR("Unknown data type: " + tokens[0]);
-			return;
+			symbolName = declaration;
 		}
-		if (type == FWORD && !is16bit) {
-			ERROR("FWORD requires 16BC");
-		}
-		const string& symbolName = tokens[1];
 
 		if (!IsValidIdentifier(symbolName) || dataMap.count(symbolName)) {
 			ERROR("Invalid/duplicate data name: " + symbolName);
 		}
 
+		string remainder;
+		getline(stream, remainder);
+		StripWhitespace(remainder);
+		vector<string> initializers;
 
-		uint16_t wordValue = 0;
-
-		if (tokens.size() == 3) {
-			if (type == FWORD) {
-				wordValue = ConvertFloatData(tokens[2]);
-			}
-			else {
-				wordValue = ConvertIntegerData(tokens[2], type);
+		if (isArray) {
+			if (!remainder.empty()) {
+				if (remainder.front() == '=') {
+					remainder.erase(remainder.begin());
+					StripWhitespace(remainder);
+				}
+				if (remainder.size() < 2 || remainder.front() != '{' || remainder.back() != '}') {
+					ERROR("Array initializer must use braces: " + line);
+				}
+				initializers = SplitArrayValues(remainder.substr(1, remainder.size() - 2));
+				if (initializers.size() > arraySize) {
+					ERROR("Too many initializers for array: " + symbolName);
+				}
 			}
 		}
+		else if (!remainder.empty()) {
+			// Scalar declarations retain the original `WORD name value` syntax.
+			initializers.push_back(remainder);
+		}
+
+		vector<uint16_t> values(arraySize, 0);
+		for (size_t i = 0; i < initializers.size(); ++i) {
+			values[i] = type == FWORD
+				? ConvertFloatData(initializers[i])
+				: ConvertIntegerData(initializers[i], type);
+		}
+
 		asmData mappedEntry{};
 		mappedEntry.type = type;
-		mappedEntry.RelativeLocation = offset++;
-		mappedEntry.initalised = tokens.size() == 3;
+		mappedEntry.RelativeLocation = static_cast<int>(offset);
+		mappedEntry.initalised = !initializers.empty();
+		mappedEntry.bitdata8 = static_cast<uint8_t>(values[0]);
+		mappedEntry.bitdata16 = values[0];
 
-		// dataBits is the authoritative unsigned representation.
-		mappedEntry.bitdata8 = static_cast<uint8_t>(wordValue);
-		mappedEntry.bitdata16 = wordValue;
 		dataMap.emplace(symbolName, mappedEntry);
-		dataWordValues.emplace(symbolName, wordValue);
+		dataWordValues.emplace(symbolName, std::move(values));
+		offset += arraySize;
 	}
+	dataWordCount = offset;
 }
 
 //============================================
@@ -345,78 +445,79 @@ INSTRUCTIONS BranchOpcode(const string& mnemonic) {
 }
 
 void StackOperand(INSTRUCTIONS operation, const string& reg) {
-    ValidateUserRegister(reg, 15);
-    unsigned index = GetRegisterIndex(reg, 15);
-    if (index < 4) { emit(operation, reg); return; }
-    string scratch = index == 14 ? "r14" : "r15";
-    emit(STR, "EAX"); emit(STA, scratch);
-    if (operation == PUSH) { emit(STR, reg); emit(STA, "EAX"); emit(PUSH, "EAX"); }
-    else { emit(POP, "EAX"); emit(STR, "EAX"); emit(STA, reg); }
-    emit(STR, scratch); emit(STA, "EAX");
+	ValidateUserRegister(reg, 15);
+	unsigned index = GetRegisterIndex(reg, 15);
+	if (index < 4) { emit(operation, reg); return; }
+	string scratch = index == 14 ? "r14" : "r15";
+	emit(STR, "EAX"); emit(STA, scratch);
+	if (operation == PUSH) { emit(STR, reg); emit(STA, "EAX"); emit(PUSH, "EAX"); }
+	else { emit(POP, "EAX"); emit(STR, "EAX"); emit(STA, reg); }
+	emit(STR, scratch); emit(STA, "EAX");
 }
 
 // Memory transport through EAX; temporary stack slot preserves it.
 void ReadToRegister(const string& destination, const string& address, bool indirect) {
-    ValidateUserRegister(destination, 15);
-    bool preserve = GetRegisterIndex(destination, 15) != 0;
-    if (preserve) emit(PUSH, "EAX");
-    if (indirect) { ValidateUserRegister(address, 15); emit(STR, address); }
-    else { emit(LDA_IMM, addressRegister, address); emit(STR, addressRegister); }
-    emit(RRAM, "EAX");
-    if (preserve) {
-        emit(STR, "EAX"); emit(POP, "EAX"); emit(STA, destination);
-    }
+	ValidateUserRegister(destination, 15);
+	bool preserve = GetRegisterIndex(destination, 15) != 0;
+	if (preserve) emit(PUSH, "EAX");
+	if (indirect) { ValidateUserRegister(address, 15); emit(STR, address); }
+	else { emit(LDA_IMM, addressRegister, address); emit(STR, addressRegister); }
+	emit(RRAM, "EAX");
+	if (preserve) {
+		emit(STR, "EAX"); emit(POP, "EAX"); emit(STA, destination);
+	}
 }
 void WriteFromRegister(const string& source, const string& address, bool indirect) {
-    ValidateUserRegister(source, 15);
-    // The hardware WRAM field only addresses EAX..EDX.
-    if (GetRegisterIndex(source, 15) < 4) {
-        if (indirect) { ValidateUserRegister(address, 15); emit(STR, address); }
-        else { emit(LDA_IMM, addressRegister, address); emit(STR, addressRegister); }
-        emit(WRAM, source);
-    } else {
-        string transport = indirect && GetRegisterIndex(address, 15) == 0 ? "EDX" : "EAX";
-        string actualAddress = address;
-        if (indirect && GetRegisterIndex(address, 15) == 15) {
-            actualAddress = GetRegisterIndex(source, 15) == 13 ? "r15" : "r14";
-            emit(STR, address); emit(STA, actualAddress);
-        }
-        emit(STR, source); emit(PUSH, transport); emit(STA, transport);
-        if (indirect) emit(STR, actualAddress);
-        else { emit(LDA_IMM, addressRegister, address); emit(STR, addressRegister); }
-        emit(WRAM, transport); emit(POP, transport);
-    }
+	ValidateUserRegister(source, 15);
+	// The hardware WRAM field only addresses EAX..EDX.
+	if (GetRegisterIndex(source, 15) < 4) {
+		if (indirect) { ValidateUserRegister(address, 15); emit(STR, address); }
+		else { emit(LDA_IMM, addressRegister, address); emit(STR, addressRegister); }
+		emit(WRAM, source);
+	}
+	else {
+		string transport = indirect && GetRegisterIndex(address, 15) == 0 ? "EDX" : "EAX";
+		string actualAddress = address;
+		if (indirect && GetRegisterIndex(address, 15) == 15) {
+			actualAddress = GetRegisterIndex(source, 15) == 13 ? "r15" : "r14";
+			emit(STR, address); emit(STA, actualAddress);
+		}
+		emit(STR, source); emit(PUSH, transport); emit(STA, transport);
+		if (indirect) emit(STR, actualAddress);
+		else { emit(LDA_IMM, addressRegister, address); emit(STR, addressRegister); }
+		emit(WRAM, transport); emit(POP, transport);
+	}
 }
 
 void GenerateInstructions() {
 	const map<string, INSTRUCTIONS> binaryOperations = {
-		{"ADD", ADD},
-		{"SUB", SUB},
-		{"AND", AND},
-		{"OR", OR},
-		{"XOR", XOR}
+		{ "ADD", ADD },
+		{ "SUB", SUB },
+		{ "AND", AND },
+		{ "OR", OR },
+		{ "XOR", XOR }
 	};
 	const map<string, INSTRUCTIONS> extendedOperations = {
-		{"MULT", SMULT},
-		{"DIV", SDIV},
-		{"UMULT", MULT},
-		{"UDIV", DIV},
-		{"FMULT", FLMULT},
-		{"FDIV", FLDIV},
-		{"FADD", FLADD},
-		{"FSUB", FLSUB},
-		{"SMULT", SMULT},
-		{"SDIV", SDIV},
-		{"FLADD", FLADD},
-		{"FLSUB", FLSUB},
-		{"FLMULT", FLMULT},
-		{"FLDIV", FLDIV}
+		{ "MULT", SMULT },
+		{ "DIV", SDIV },
+		{ "UMULT", MULT },
+		{ "UDIV", DIV },
+		{ "FMULT", FLMULT },
+		{ "FDIV", FLDIV },
+		{ "FADD", FLADD },
+		{ "FSUB", FLSUB },
+		{ "SMULT", SMULT },
+		{ "SDIV", SDIV },
+		{ "FLADD", FLADD },
+		{ "FLSUB", FLSUB },
+		{ "FLMULT", FLMULT },
+		{ "FLDIV", FLDIV }
 	};
 	const map<string, INSTRUCTIONS> conversionOperations = {
-		{"ITOF", ITOF},
-		{"UTOF", UTOF},
-		{"FTOI", FTOI},
-		{"FTOU", FTOU}
+		{ "ITOF", ITOF },
+		{ "UTOF", UTOF },
+		{ "FTOI", FTOI },
+		{ "FTOU", FTOU }
 	};
 
 	for (size_t sourceIndex = 0; sourceIndex < codeSection.size(); ++sourceIndex) {
@@ -493,30 +594,33 @@ void GenerateInstructions() {
 				emit(FCMP, tokens[1], tokens[2]);
 			}
 		}
-        else if (mnemonic == "MOV") {
-            ValidateSourceOperandCount(tokens, 2, line);
-            string a = tokens[1], b = tokens[2];
-            auto bracketed = [](const string& operand) {
-                return operand.size() >= 3 && operand.front() == '[' && operand.back() == ']';
-            };
-            if (isRegisterName(a)) {
-                ValidateUserRegister(a, 15);
-                if (isRegisterName(b)) {
-                    ValidateUserRegister(b, 15); emit(STR, b); emit(STA, a);
-                } else if (bracketed(b)) {
-                    string inner = b.substr(1, b.size() - 2);
-                    if (isRegisterName(inner)) ReadToRegister(a, inner, true);
-                    else { if (!IsValidIdentifier(inner)) ParseNumber(inner); emit(LDA_IMM, a, inner); }
-                } else if (dataMap.count(b)) ReadToRegister(a, b, false);
-                else emit(LDA_IMM, a, b);
-            } else {
-                bool indirect = false;
-                if (bracketed(a)) { a = a.substr(1, a.size() - 2); indirect = isRegisterName(a); }
-                if (!indirect && !dataMap.count(a)) ParseNumber(a);
-                if (!isRegisterName(b)) ERROR("Memory MOV source must be a register");
-                WriteFromRegister(b, a, indirect);
-            }
-        }
+		else if (mnemonic == "MOV") {
+			ValidateSourceOperandCount(tokens, 2, line);
+			string a = tokens[1], b = tokens[2];
+			auto bracketed = [](const string& operand) {
+				return operand.size() >= 3 && operand.front() == '[' && operand.back() == ']';
+				};
+			if (isRegisterName(a)) {
+				ValidateUserRegister(a, 15);
+				if (isRegisterName(b)) {
+					ValidateUserRegister(b, 15); emit(STR, b); emit(STA, a);
+				}
+				else if (bracketed(b)) {
+					string inner = b.substr(1, b.size() - 2);
+					if (isRegisterName(inner)) ReadToRegister(a, inner, true);
+					else { if (!IsValidIdentifier(inner)) ParseNumber(inner); emit(LDA_IMM, a, inner); }
+				}
+				else if (dataMap.count(b)) ReadToRegister(a, b, false);
+				else emit(LDA_IMM, a, b);
+			}
+			else {
+				bool indirect = false;
+				if (bracketed(a)) { a = a.substr(1, a.size() - 2); indirect = isRegisterName(a); }
+				if (!indirect && !dataMap.count(a)) ParseNumber(a);
+				if (!isRegisterName(b)) ERROR("Memory MOV source must be a register");
+				WriteFromRegister(b, a, indirect);
+			}
+		}
 		else if (mnemonic == "BRA" || mnemonic == "BRZ" || mnemonic == "BRN" || mnemonic == "BRP") {
 			ValidateSourceOperandCount(tokens, 1, line);
 			INSTRUCTIONS opcode = BranchOpcode(mnemonic);
@@ -536,53 +640,53 @@ void GenerateInstructions() {
 			emit(NOT, tokens[1]);
 			emit(STA, tokens[1]);
 		}
-        else if (mnemonic == "CALL") {
-            ValidateSourceOperandCount(tokens, 1, line);
-            if (isRegisterName(tokens[1])) ERROR("CALL requires a label/address");
-            string returnLabel = CreateInternalLabel();
-            emit(STR, "EAX"); emit(STA, "r15");
-            emit(LDA_IMM, "EAX", returnLabel); emit(PUSH, "EAX");
-            emit(STR, "r15"); emit(STA, "EAX");
-            emit(LDA_IMM, addressRegister, tokens[1]); emit(BRA, addressRegister);
-            defineLabel(returnLabel, true);
-        }
-        else if (mnemonic == "IRET") {
-            ValidateSourceOperandCount(tokens, 0, line);
-            if (!is16bit) ERROR("IRET requires .16bc and a 15-word device interrupt frame");
-            // Keep interrupts masked throughout. Patch two private immediate
-            // words, avoiding the R14 clobber in ordinary POP/RET macros.
-            // Executable RAM is writable; each IRET expansion owns its slots.
-            string savedEAX = CreateInternalLabel();
-            string returnPC = CreateInternalLabel();
-            emit(POP, "EAX");
-            emit(LDA_IMM, "r15", savedEAX);
-            emit(STR, "r15"); emit(WRAM, "EAX");
-            emit(POP, "EBX"); emit(POP, "ECX"); emit(POP, "EDX");
-            for (unsigned reg = 5; reg <= 14; ++reg) {
-                emit(POP, "EAX"); emit(STR, "EAX");
-                emit(STA, "r" + to_string(reg));
-            }
-            emit(POP, "EAX");
-            emit(LDA_IMM, "r15", returnPC);
-            emit(STR, "r15"); emit(WRAM, "EAX");
-            defineLabel(savedEAX, true);
-            internalLabelWordOffsets.emplace(savedEAX, 1);
-            emit(LDA_IMM, "EAX", "0");
-            defineLabel(returnPC, true);
-            internalLabelWordOffsets.emplace(returnPC, 1);
-            emit(LDA_IMM, "r15", "0");
-            emit(BRA, "r15");
-        }
-        else if (mnemonic == "RET") {
-            ValidateSourceOperandCount(tokens, 0, line);
-            emit(STR, "EAX"); emit(STA, "r15"); emit(POP, "EAX");
-            emit(STR, "EAX"); emit(STA, addressRegister);
-            emit(STR, "r15"); emit(STA, "EAX"); emit(BRA, addressRegister);
-        }
-        else if (mnemonic == "PSH" || mnemonic == "PUSH" || mnemonic == "POP") {
-            ValidateSourceOperandCount(tokens, 1, line);
-            StackOperand(mnemonic == "POP" ? POP : PUSH, tokens[1]);
-        }
+		else if (mnemonic == "CALL") {
+			ValidateSourceOperandCount(tokens, 1, line);
+			if (isRegisterName(tokens[1])) ERROR("CALL requires a label/address");
+			string returnLabel = CreateInternalLabel();
+			emit(STR, "EAX"); emit(STA, "r15");
+			emit(LDA_IMM, "EAX", returnLabel); emit(PUSH, "EAX");
+			emit(STR, "r15"); emit(STA, "EAX");
+			emit(LDA_IMM, addressRegister, tokens[1]); emit(BRA, addressRegister);
+			defineLabel(returnLabel, true);
+		}
+		else if (mnemonic == "IRET") {
+			ValidateSourceOperandCount(tokens, 0, line);
+			if (!is16bit) ERROR("IRET requires .16bc and a 15-word device interrupt frame");
+			// Keep interrupts masked throughout. Patch two private immediate
+			// words, avoiding the R14 clobber in ordinary POP/RET macros.
+			// Executable RAM is writable; each IRET expansion owns its slots.
+			string savedEAX = CreateInternalLabel();
+			string returnPC = CreateInternalLabel();
+			emit(POP, "EAX");
+			emit(LDA_IMM, "r15", savedEAX);
+			emit(STR, "r15"); emit(WRAM, "EAX");
+			emit(POP, "EBX"); emit(POP, "ECX"); emit(POP, "EDX");
+			for (unsigned reg = 5; reg <= 14; ++reg) {
+				emit(POP, "EAX"); emit(STR, "EAX");
+				emit(STA, "r" + to_string(reg));
+			}
+			emit(POP, "EAX");
+			emit(LDA_IMM, "r15", returnPC);
+			emit(STR, "r15"); emit(WRAM, "EAX");
+			defineLabel(savedEAX, true);
+			internalLabelWordOffsets.emplace(savedEAX, 1);
+			emit(LDA_IMM, "EAX", "0");
+			defineLabel(returnPC, true);
+			internalLabelWordOffsets.emplace(returnPC, 1);
+			emit(LDA_IMM, "r15", "0");
+			emit(BRA, "r15");
+		}
+		else if (mnemonic == "RET") {
+			ValidateSourceOperandCount(tokens, 0, line);
+			emit(STR, "EAX"); emit(STA, "r15"); emit(POP, "EAX");
+			emit(STR, "EAX"); emit(STA, addressRegister);
+			emit(STR, "r15"); emit(STA, "EAX"); emit(BRA, addressRegister);
+		}
+		else if (mnemonic == "PSH" || mnemonic == "PUSH" || mnemonic == "POP") {
+			ValidateSourceOperandCount(tokens, 1, line);
+			StackOperand(mnemonic == "POP" ? POP : PUSH, tokens[1]);
+		}
 		else if (mnemonic == "SFTL" || mnemonic == "SFTR") {
 			ValidateSourceOperandCount(tokens, 2, line);
 			ValidateUserRegister(tokens[1], 3);
@@ -715,9 +819,9 @@ void MapLabels() {
 			ERROR("Invalid label position: " + symbolName);
 		}
 		size_t wordOffset = 0;
-        auto offset = internalLabelWordOffsets.find(symbolName);
-        if (offset != internalLabelWordOffsets.end()) wordOffset = offset->second;
-        symbolAddresses.emplace(symbolName, instructionAddresses[registerIndex] + wordOffset);
+		auto offset = internalLabelWordOffsets.find(symbolName);
+		if (offset != internalLabelWordOffsets.end()) wordOffset = offset->second;
+		symbolAddresses.emplace(symbolName, instructionAddresses[registerIndex] + wordOffset);
 	}
 	for (const auto& [symbolName, mappedEntry] : dataMap) {
 		if (!symbolAddresses.emplace(symbolName, wordAddress + static_cast<size_t>(mappedEntry.RelativeLocation)).second) {
@@ -729,7 +833,7 @@ void MapLabels() {
 	if (is16bit) {
 		memoryCapacity = 59180u;
 	}
-	if (wordAddress + dataMap.size() > memoryCapacity) {
+	if (wordAddress + dataWordCount > memoryCapacity) {
 		ERROR("Code/data exceeds code and heap region");
 	}
 	for (const auto& [symbolName, address] : symbolAddresses) {
@@ -1143,18 +1247,24 @@ void FinalConvert() {
 
 void AppendData() {
 	if (is16bit) {
-		vector<uint16_t> dataWords(dataMap.size(), 0);
-
+		vector<uint16_t> dataWords(dataWordCount, 0);
 		for (const auto& [symbolName, data] : dataMap) {
-			dataWords.at(static_cast<size_t>(data.RelativeLocation)) = dataWordValues.at(symbolName);
+			const vector<uint16_t>& values = dataWordValues.at(symbolName);
+			size_t base = static_cast<size_t>(data.RelativeLocation);
+			for (size_t i = 0; i < values.size(); ++i) {
+				dataWords.at(base + i) = values[i];
+			}
 		}
 		final16b.insert(final16b.end(), dataWords.begin(), dataWords.end());
 	}
 	else {
-		vector<uint8_t> dataWords(dataMap.size(), 0);
-
+		vector<uint8_t> dataWords(dataWordCount, 0);
 		for (const auto& [symbolName, data] : dataMap) {
-			dataWords.at(static_cast<size_t>(data.RelativeLocation)) = static_cast<uint8_t>(dataWordValues.at(symbolName));
+			const vector<uint16_t>& values = dataWordValues.at(symbolName);
+			size_t base = static_cast<size_t>(data.RelativeLocation);
+			for (size_t i = 0; i < values.size(); ++i) {
+				dataWords.at(base + i) = static_cast<uint8_t>(values[i]);
+			}
 		}
 		final8b.insert(final8b.end(), dataWords.begin(), dataWords.end());
 	}
